@@ -13,8 +13,8 @@ from tqdm import tqdm
 # 0. Setup and Configuration
 # ==========================================
 
-if not os.path.exists('plots'):
-    os.makedirs('plots')
+if not os.path.exists('plots_digital_asian'):
+    os.makedirs('plots_digital_asian')
 
 # Model Parameters
 S0 = 100
@@ -24,16 +24,19 @@ sigma = 0.1
 d = 32
 
 # Simulation Parameters
-# N as powers of 2
 POWERS = np.arange(7, 14) # 7 to 13
 SAMPLE_SIZES = 2**POWERS
 N_REPEATS = 30 # Repetitions for stable RMSE
 
+# Gauss-Legendre Quadrature Nodes/Weights (fixed size)
+N_QUAD = 30
+GL_NODES, GL_WEIGHTS = np.polynomial.legendre.leggauss(N_QUAD)
+
 # ==========================================
-# 1. Model: Asian Option with Cholesky Path
+# 1. Model: Digital Asian Option
 # ==========================================
 
-class AsianOptionCholesky:
+class DigitalAsianOption:
     def __init__(self, S0=100, K=100, T=1.0, r=0.1, sigma=0.1, d=32):
         self.S0 = S0
         self.K = K
@@ -43,21 +46,32 @@ class AsianOptionCholesky:
         self.d = d
         self.dt = T / d
         
-        # 1. Covariance Matrix
+        # 1. Covariance Matrix construction
         times = np.linspace(self.dt, T, d)
         C = np.minimum(times[:, None], times[None, :])
         
         # 2. Cholesky Decomposition (L @ L.T = C)
         self.A = np.linalg.cholesky(C)
         
-        # Precompute drift
+        # Precompute drift for simulation
         self.drift_term = (self.r - 0.5 * self.sigma**2) * times
 
-    def payoff(self, z):
+    def get_S_mean(self, z):
+        """Helper to get arithmetic mean of prices given z."""
         if z.ndim == 1: z = z.reshape(1, -1)
         B = z @ self.A.T
         S = self.S0 * np.exp(self.drift_term + self.sigma * B)
-        S_mean = np.mean(S, axis=1)
+        return np.mean(S, axis=1)
+
+    def payoff_digital(self, z):
+        """Digital Payoff: 1 if S_mean > K else 0."""
+        S_mean = self.get_S_mean(z)
+        p = np.where(S_mean > self.K, 1.0, 0.0)
+        return np.exp(-self.r * self.T) * p
+    
+    def payoff_arithmetic(self, z):
+        """Arithmetic Payoff (proxy for AS gradient): max(S_mean - K, 0)."""
+        S_mean = self.get_S_mean(z)
         return np.exp(-self.r * self.T) * np.maximum(S_mean - self.K, 0)
 
 # ==========================================
@@ -75,20 +89,29 @@ def get_gradient(f, z, epsilon=1e-5):
     return grad
 
 def get_active_subspace(model, M=256):
-    """Estimate dominant gradient direction (Active Subspace)"""
+    """
+    Estimate dominant gradient direction using the Arithmetic payoff as a proxy.
+    The digital payoff has zero gradient almost everywhere, so we use the 
+    underlying arithmetic payoff structure to find the 'direction of importance'.
+    """
     sampler = qmc.Sobol(d=model.d, scramble=True)
     z_pilot = stats.norm.ppf(sampler.random(M))
     
     grads = []
+    # Use Arithmetic payoff for gradient estimation
     for i in range(M):
-        g = get_gradient(model.payoff, z_pilot[i])
+        g = get_gradient(model.payoff_arithmetic, z_pilot[i])
         grads.append(g)
     grads = np.array(grads)
     
     C_hat = (grads.T @ grads) / M
     evals, evecs = np.linalg.eigh(C_hat)
     u_as = evecs[:, -1]
-    if np.sum(u_as) < 0: u_as = -u_as
+    
+    # Standardize sign: ensure mean moves up with positive u
+    test_z = u_as * 0.1
+    if model.get_S_mean(test_z)[0] < model.get_S_mean(-test_z)[0]:
+        u_as = -u_as
     return u_as
 
 def get_z1_direction(d):
@@ -108,23 +131,29 @@ def householder_matrix(u):
     return H * (-sign)
 
 def get_odis_shift(model):
-    """Optimal Drift for Importance Sampling"""
+    """
+    Optimal Drift for Importance Sampling (Digital Option).
+    We find the 'Most Probable Point' (MPP) on the limit state surface S_mean(z) = K.
+    Minimize 0.5 * ||z||^2 subject to S_mean(z) = K.
+    """
+    # Constraint
+    def constr(z):
+        return model.get_S_mean(z)[0] - model.K
+    
+    # Objective: min norm
     def obj(z):
-        p = model.payoff(z)[0]
-        if p <= 1e-12: return 1e6
-        return 0.5 * np.sum(z**2) - np.log(p)
+        return 0.5 * np.sum(z**2)
+
+    # Initial guess: Scaled vector of ones or pilot samples
+    x0 = np.ones(model.d) * 0.1
     
-    # Multi-start to avoid local minima in OTM cases
-    best_res = None
-    best_val = np.inf
-    starts = [np.zeros(model.d), np.ones(model.d)*0.5, np.ones(model.d)*1.5]
+    cons = ({'type': 'eq', 'fun': constr})
+    res = minimize(obj, x0, method='SLSQP', constraints=cons, tol=1e-4)
     
-    for x0 in starts:
-        res = minimize(obj, x0, method='L-BFGS-B')
-        if res.fun < best_val:
-            best_val = res.fun
-            best_res = res
-    return best_res.x
+    if not res.success:
+        return np.zeros(model.d)
+        
+    return res.x
 
 # ==========================================
 # 3. Estimators
@@ -140,19 +169,18 @@ def standard_estimator(model, N, method='MC', mu_shift=None):
     weights = np.ones(N)
     if mu_shift is not None:
         # Importance Sampling Weight
-        # We treat 'z' as the base noise. The sample is X = z + mu.
-        # Weight = exp(-X.mu + 0.5*mu^2)
         X = z + mu_shift
         dot = np.sum(X * mu_shift, axis=1)
         mu_sq = 0.5 * np.sum(mu_shift**2)
         weights = np.exp(-dot + mu_sq)
-        payoffs = model.payoff(X)
+        # Use digital payoff
+        payoffs = model.payoff_digital(X)
     else:
-        payoffs = model.payoff(z)
+        payoffs = model.payoff_digital(z)
         
     return np.mean(payoffs * weights)
 
-def pre_int_estimator(model, N, u, Q, mu_perp=None, method='RQMC'):
+def pre_int_estimator_quad(model, N, u, Q, mu_perp=None, method='RQMC'):
     d_perp = model.d - 1
     if method == 'MC':
         z_perp = np.random.standard_normal((N, d_perp))
@@ -166,32 +194,63 @@ def pre_int_estimator(model, N, u, Q, mu_perp=None, method='RQMC'):
         dot = np.sum(X_perp * mu_perp, axis=1)
         mu_sq = 0.5 * np.sum(mu_perp**2)
         weights = np.exp(-dot + mu_sq)
-        z_perp = X_perp # Use shifted samples
+        z_perp = X_perp 
 
-    # Geometric Constants
     U_perp = Q[:, 1:]
     Au = model.A @ u 
-    AU_perp = model.A @ U_perp
+    AU_perp_z_perp = (model.A @ U_perp) @ z_perp.T 
+    
     beta = model.sigma * Au
-    const_part = np.log(model.S0) + model.drift_term
+    const_log_S = np.log(model.S0) + model.drift_term
     
     estimates = np.zeros(N)
-    exponent_perps = model.sigma * (z_perp @ AU_perp.T)
+    
+    # Fixed Integration Upper Limit (sufficiently large to cover N(0,1) mass)
+    UPPER_LIMIT = 10.0 
     
     for i in range(N):
-        alpha = np.exp(const_part + exponent_perps[i])
-        def g(v): return np.mean(alpha * np.exp(beta * v)) - model.K
+        perp_contribution = model.sigma * AU_perp_z_perp[:, i]
+        alpha = np.exp(const_log_S + perp_contribution)
         
-        try: v_star = brentq(g, -30, 30)
-        except ValueError: v_star = -30 if g(0) > 0 else 30
-            
-        if v_star < 25:
-            d1 = beta - v_star
-            term1 = np.mean(alpha * np.exp(0.5 * beta**2) * stats.norm.cdf(d1))
-            term2 = model.K * stats.norm.cdf(-v_star)
-            val = np.exp(-model.r * model.T) * (term1 - term2)
-        else:
+        def g(v): 
+            return np.mean(alpha * np.exp(beta * v)) - model.K
+        
+        # 1. Root Finding
+        try:
+            # We look for root in [-15, 15]
+            if g(-15) * g(15) < 0:
+                v_star = brentq(g, -15, 15)
+            else:
+                v_star = -15.0 if g(0) > 0 else 15.0
+        except ValueError:
+             v_star = -15.0 if g(0) > 0 else 15.0
+        
+        # 2. Quadrature Integration
+        # We need Integral_{v_star}^{+inf} phi(z) dz
+        
+        # Clamp v_star to reasonable bounds to avoid numerical issues
+        # (If v_star < -10, prob is ~1. If v_star > 10, prob is ~0)
+        a = max(v_star, -10.0)
+        b = UPPER_LIMIT 
+        
+        if a >= b:
             val = 0.0
+        else:
+            # Map [-1, 1] nodes to [a, b]
+            scaled_nodes = 0.5 * (b - a) * GL_NODES + 0.5 * (b + a)
+            jacobian = 0.5 * (b - a)
+            
+            # Integrand: Standard Normal PDF
+            pdf_vals = stats.norm.pdf(scaled_nodes)
+            integral = np.sum(GL_WEIGHTS * pdf_vals) * jacobian
+            
+            # If v_star was really small (<-10), we might have missed some left-tail mass,
+            # but usually integrating [-10, 10] covers >99.999% of mass.
+            # To be precise: if v_star < -10, we could just take val = 1.0 (approx)
+            # but the quadrature on [-10, 10] returns ~1.0 anyway.
+            
+            val = np.exp(-model.r * model.T) * integral
+
         estimates[i] = val * weights[i]
         
     return np.mean(estimates)
@@ -201,50 +260,58 @@ def pre_int_estimator(model, N, u, Q, mu_perp=None, method='RQMC'):
 # ==========================================
 
 def run_experiment(K_target):
-    print(f"\n--- Running Experiment for K = {K_target} ---")
-    model = AsianOptionCholesky(S0=S0, K=K_target, T=T, r=r, sigma=sigma, d=d)
+    print(f"\n--- Running Experiment for K = {K_target} (Digital) ---")
+    model = DigitalAsianOption(S0=S0, K=K_target, T=T, r=r, sigma=sigma, d=d)
     
     # Directions
     u_z1 = get_z1_direction(d)
     Q_z1 = np.eye(d)
+    
+    # Active Subspace Direction (using Arithmetic proxy)
     u_as = get_active_subspace(model)
     Q_as = householder_matrix(u_as)
     
-    # ODIS Shift (Only needed for K=120)
+    # ODIS Shift calculation
     mu_opt = None
     mu_perp_as = None
+    
     if K_target == 120:
+        print("  -> Computing ODIS shift...")
         mu_opt = get_odis_shift(model)
+        # Project mu_opt into the rotated space defined by Q_as
         mu_local = Q_as.T @ mu_opt 
         mu_perp_as = mu_local[1:] 
 
-    # Ground Truth
+    # Ground Truth Generation
+    print("  -> Computing Ground Truth...")
     if K_target == 120:
-        true_val = pre_int_estimator(model, 2**17, u_as, Q_as, mu_perp_as, 'RQMC')
+        true_val = pre_int_estimator_quad(model, 2**17, u_as, Q_as, mu_perp_as, 'RQMC')
     else:
-        true_val = pre_int_estimator(model, 2**17, u_as, Q_as, None, 'RQMC')
+        true_val = pre_int_estimator_quad(model, 2**17, u_as, Q_as, None, 'RQMC')
     print(f"  -> Truth: {true_val:.6f}")
 
     methods = {}
+    
     if K_target == 100:
-        # Comparison: MC vs RQMC vs PreInt(z1) vs PreInt(AS) (No ODIS)
+        # Part A: Comparison of Smoothing
         methods['Crude MC'] = lambda n: standard_estimator(model, n, 'MC')
         methods['Plain RQMC'] = lambda n: standard_estimator(model, n, 'RQMC')
-        methods['Pre-Int (z1)'] = lambda n: pre_int_estimator(model, n, u_z1, Q_z1, None, 'RQMC')
-        methods['Pre-Int (AS)'] = lambda n: pre_int_estimator(model, n, u_as, Q_as, None, 'RQMC')
+        methods['Pre-Int (z1)'] = lambda n: pre_int_estimator_quad(model, n, u_z1, Q_z1, None, 'RQMC')
+        methods['Pre-Int (AS)'] = lambda n: pre_int_estimator_quad(model, n, u_as, Q_as, None, 'RQMC')
         
     elif K_target == 120:
-        # Comprehensive List
+        # Part B: Variance Reduction (ODIS)
         methods['Crude MC'] = lambda n: standard_estimator(model, n, 'MC')
         methods['MC + ODIS'] = lambda n: standard_estimator(model, n, 'MC', mu_opt)
         methods['Plain RQMC'] = lambda n: standard_estimator(model, n, 'RQMC')
         methods['RQMC + ODIS'] = lambda n: standard_estimator(model, n, 'RQMC', mu_opt)
-        methods['Pre-Int (AS)'] = lambda n: pre_int_estimator(model, n, u_as, Q_as, None, 'RQMC')
-        methods['Pre-Int (AS) + ODIS'] = lambda n: pre_int_estimator(model, n, u_as, Q_as, mu_perp_as, 'RQMC')
+        methods['Pre-Int (AS)'] = lambda n: pre_int_estimator_quad(model, n, u_as, Q_as, None, 'RQMC')
+        methods['Pre-Int (AS) + ODIS'] = lambda n: pre_int_estimator_quad(model, n, u_as, Q_as, mu_perp_as, 'RQMC')
 
     results = []
     total_ops = len(SAMPLE_SIZES) * len(methods) * N_REPEATS
-    with tqdm(total=total_ops) as pbar:
+    
+    with tqdm(total=total_ops, desc="Simulating") as pbar:
         for N in SAMPLE_SIZES:
             for name, func in methods.items():
                 errs = []
@@ -268,17 +335,10 @@ def run_experiment(K_target):
 # ==========================================
 
 def get_convergence_rate(N, RMSE):
-    # Fit log(RMSE) = a + b * log(N)
-    # Slope b is the convergence rate
     slope, intercept = np.polyfit(np.log(N), np.log(RMSE), 1)
     return slope
 
 def plot_k100(df):
-    """
-    K=100 Plot: 
-    Left: Convergence (Log2 N vs RMSE)
-    Right: Cost (Time vs RMSE)
-    """
     df = df[df['K'] == 100]
     if df.empty: return
 
@@ -293,10 +353,8 @@ def plot_k100(df):
         sub = df[df['Method'] == m]
         if sub.empty: continue
         
-        # Calculate Slope
         slope = get_convergence_rate(sub['N'], sub['RMSE'])
         label_str = f"{m} (Rate $\\approx N^{{{slope:.2f}}}$)"
-        
         ax.loglog(sub['N'], sub['RMSE'], marker=mark, linestyle='-', label=label_str, base=2)
 
     # Reference Lines
@@ -307,63 +365,37 @@ def plot_k100(df):
     ref_qmc = Ns**(-1.0) * (df[df['Method']=='Plain RQMC']['RMSE'].iloc[0] * Ns[0]**1.0)
     ax.loglog(Ns, ref_qmc, 'k:', alpha=0.3, label='$O(N^{-1.0})$', base=2)
 
-    ax.set_title('K=100: Convergence Analysis (Smoothing)', fontsize=14)
+    ax.set_title('K=100 (Digital): Convergence Analysis', fontsize=14)
     ax.set_xlabel('Sample Size $N$ (log2 scale)', fontsize=12)
     ax.set_ylabel('RMSE', fontsize=12)
     ax.legend(fontsize=10)
     ax.grid(True, which="both", ls="-", alpha=0.2)
     ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
 
-    # 2. Computational Cost Plot
+    # 2. Cost Plot
     ax = axes[1]
     for m, mark in zip(methods, markers):
         sub = df[df['Method'] == m]
         if sub.empty: continue
-        # Total time for N samples vs RMSE
         ax.loglog(sub['Time'], sub['RMSE'], marker=mark, linestyle='-', label=m)
 
-    ax.set_title('K=100: Efficiency (Error vs Time)', fontsize=14)
+    ax.set_title('K=100 (Digital): Efficiency (Error vs Time)', fontsize=14)
     ax.set_xlabel('Avg Computation Time (s)', fontsize=12)
     ax.set_ylabel('RMSE', fontsize=12)
     ax.legend(fontsize=10)
     ax.grid(True, which="both", ls="-", alpha=0.2)
 
     plt.tight_layout()
-    plt.savefig('plots/K100_Smoothing_Analysis.png', dpi=300)
-    print("Saved K100_Smoothing_Analysis.png")
+    plt.savefig('plots_digital_asian/Digital_K100_Analysis.png', dpi=300)
+    print("Saved plots_digital_asian/Digital_K100_Analysis.png")
 
 def plot_k120(df):
-    """
-    K=120 Plots.
-    Plot A: Comprehensive (All methods).
-    Plot B: Variance Reduction Focus (Method vs Method+ODIS).
-    """
     df = df[df['K'] == 120]
     if df.empty: return
 
-    # --- Plot A: Comprehensive ---
-    plt.figure(figsize=(10, 7))
-    methods = df['Method'].unique()
-    
-    for m in methods:
-        sub = df[df['Method'] == m]
-        slope = get_convergence_rate(sub['N'], sub['RMSE'])
-        label_str = f"{m} ($N^{{{slope:.2f}}}$)"
-        plt.loglog(sub['N'], sub['RMSE'], marker='o', label=label_str, base=2)
-
-    plt.title('K=120: Comprehensive Comparison', fontsize=14)
-    plt.xlabel('Sample Size $N$ (log2)', fontsize=12)
-    plt.ylabel('RMSE', fontsize=12)
-    plt.grid(True, which="both", alpha=0.2)
-    plt.legend()
-    plt.savefig('plots/K120_Comprehensive.png', dpi=300)
-    print("Saved K120_Comprehensive.png")
-    plt.close()
-
-    # --- Plot B: Variance Reduction Focus ---
     plt.figure(figsize=(10, 7))
     
-    # Pairs to compare
+    # Comparison Pairs
     pairs = [
         ('Crude MC', 'MC + ODIS', 'red'),
         ('Plain RQMC', 'RQMC + ODIS', 'blue'),
@@ -383,14 +415,13 @@ def plot_k120(df):
             label_str = f"{odis} ($N^{{{slope:.2f}}}$)"
             plt.loglog(sub_o['N'], sub_o['RMSE'], color=color, linestyle='-', marker='D', label=label_str, base=2)
 
-    plt.title('K=120: Impact of Variance Reduction (ODIS)', fontsize=14)
+    plt.title('K=120 (Digital): Variance Reduction Impact (ODIS)', fontsize=14)
     plt.xlabel('Sample Size $N$ (log2)', fontsize=12)
     plt.ylabel('RMSE', fontsize=12)
     plt.grid(True, which="both", alpha=0.2)
     plt.legend()
-    plt.savefig('plots/K120_Variance_Impact.png', dpi=300)
-    print("Saved K120_Variance_Impact.png")
-    plt.close()
+    plt.savefig('plots_digital_asian/Digital_K120_Variance.png', dpi=300)
+    print("Saved plots_digital_asian/Digital_K120_Variance.png")
 
 # ==========================================
 # 6. Main Execution
@@ -402,12 +433,11 @@ if __name__ == "__main__":
     df120 = run_experiment(120)
     
     full_df = pd.concat([df100, df120])
-    full_df.to_csv('project_results.csv', index=False)
-    print("\nResults saved to CSV.")
+    full_df.to_csv('digital_option_results.csv', index=False)
+    print("\nResults saved to digital_option_results.csv.")
     
     # 2. Generate Plots
     plot_k100(full_df)
     plot_k120(full_df)
     
-    print("\nProject Complete.")
-    
+    print("\nDigital Option Analysis Complete.")
