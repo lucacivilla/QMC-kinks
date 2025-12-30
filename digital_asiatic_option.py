@@ -26,7 +26,7 @@ d = 32
 # Simulation Parameters
 POWERS = np.arange(7, 14) # 7 to 13
 SAMPLE_SIZES = 2**POWERS
-N_REPEATS = 30 # Repetitions for stable RMSE
+N_REPEATS = 100 # Repetitions for stable RMSE
 
 # Gauss-Legendre Quadrature Nodes/Weights (fixed size)
 N_QUAD = 30
@@ -88,7 +88,7 @@ def get_gradient(f, z, epsilon=1e-5):
         grad[i] = (f(z_p) - base) / epsilon
     return grad
 
-def get_active_subspace(model, M=256):
+def get_active_subspace(model, M=128):
     """
     Estimate dominant gradient direction using the Arithmetic payoff as a proxy.
     The digital payoff has zero gradient almost everywhere, so we use the 
