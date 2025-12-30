@@ -33,6 +33,61 @@ N_QUAD = 30
 GL_NODES, GL_WEIGHTS = np.polynomial.legendre.leggauss(N_QUAD)
 
 # ==========================================
+#           Adaptive N Finder
+# ==========================================
+
+def find_N_specific_digital(model, tol=0.01):
+    """
+    Sequential search starting at N=128.
+    Uses specific recursive update formulas for Mean and Variance.
+    """
+    z_score = 1.96  # 95% Confidence
+    
+    # 1. Start with N = 128
+    N = 128
+    z_init = np.random.standard_normal((N, model.d))
+    Z_values = model.payoff_digital(z_init)
+    
+    # Initial Statistics
+    mu = np.mean(Z_values)
+    var = np.var(Z_values, ddof=1)
+    
+    print(f"\n--- Specific Recursive Search (Digital, Start N={N}) ---")
+    print(f"{'N':<10} | {'Mean':<10} | {'Var':<10} | {'RelErr':<10}")
+    print("-" * 55)
+    
+    while True:
+        # 2. Generate new single Z_(N+1)
+        z_new = np.random.standard_normal((1, model.d))
+        Z_next = model.payoff_digital(z_new)[0]
+        
+        mu_old = mu
+        
+        # 3. Update Statistics (Specific Formulas)
+        mu = (N / (N + 1)) * mu + Z_next / (N + 1)
+        var = ((N - 1) / N) * var + (Z_next - mu_old)**2 / (N + 1)
+        
+        # 4. Increment N
+        N += 1
+        
+        # 5. Check Convergence
+        sigma = np.sqrt(max(var, 0.0))
+        
+        if abs(mu) > 1e-12 and sigma > 0:
+            half_width = z_score * sigma / np.sqrt(N)
+            rel_err = half_width / abs(mu)
+            
+            if rel_err <= tol:
+                print("-" * 55)
+                print(f"Converged at N = {N}")
+                print(f"Final Mean: {mu:.6f}")
+                print(f"Final Var:  {var:.6f}")
+                return N, mu
+            
+            if N % 5000 == 0:
+                print(f"{N:<10} | {mu:<10.4f} | {var:<10.4f} | {rel_err:<10.2%}")
+
+# ==========================================
 # 1. Model: Digital Asian Option
 # ==========================================
 
@@ -339,6 +394,11 @@ def get_convergence_rate(N, RMSE):
     return slope
 
 def plot_k100(df):
+    """
+    K=100 Plot: 
+    Left: Convergence (Log2 N vs RMSE)
+    Right: Cost (Time vs RMSE)
+    """
     df = df[df['K'] == 100]
     if df.empty: return
 
@@ -357,15 +417,17 @@ def plot_k100(df):
         label_str = f"{m} (Rate $\\approx N^{{{slope:.2f}}}$)"
         ax.loglog(sub['N'], sub['RMSE'], marker=mark, linestyle='-', label=label_str, base=2)
 
-    # Reference Lines
     Ns = df['N'].unique()
-    ref_mc = Ns**(-0.5) * (df[df['Method']=='Crude MC']['RMSE'].iloc[0] * Ns[0]**0.5)
-    ax.loglog(Ns, ref_mc, 'k--', alpha=0.3, label='$O(N^{-0.5})$', base=2)
+    # Reference Lines
+    if not df[df['Method']=='Crude MC'].empty:
+        ref_mc = Ns**(-0.5) * (df[df['Method']=='Crude MC']['RMSE'].iloc[0] * Ns[0]**0.5)
+        ax.loglog(Ns, ref_mc, 'k--', alpha=0.3, label='$O(N^{-0.5})$', base=2)
     
-    ref_qmc = Ns**(-1.0) * (df[df['Method']=='Plain RQMC']['RMSE'].iloc[0] * Ns[0]**1.0)
-    ax.loglog(Ns, ref_qmc, 'k:', alpha=0.3, label='$O(N^{-1.0})$', base=2)
+    if not df[df['Method']=='Plain RQMC'].empty:
+        ref_qmc = Ns**(-1.0) * (df[df['Method']=='Plain RQMC']['RMSE'].iloc[0] * Ns[0]**1.0)
+        ax.loglog(Ns, ref_qmc, 'k:', alpha=0.3, label='$O(N^{-1.0})$', base=2)
 
-    ax.set_title('K=100 (Digital): Convergence Analysis', fontsize=14)
+    ax.set_title('K=100 (Digital Quad): Convergence Analysis', fontsize=14)
     ax.set_xlabel('Sample Size $N$ (log2 scale)', fontsize=12)
     ax.set_ylabel('RMSE', fontsize=12)
     ax.legend(fontsize=10)
@@ -379,23 +441,48 @@ def plot_k100(df):
         if sub.empty: continue
         ax.loglog(sub['Time'], sub['RMSE'], marker=mark, linestyle='-', label=m)
 
-    ax.set_title('K=100 (Digital): Efficiency (Error vs Time)', fontsize=14)
+    ax.set_title('K=100 (Digital Quad): Efficiency (Error vs Time)', fontsize=14)
     ax.set_xlabel('Avg Computation Time (s)', fontsize=12)
     ax.set_ylabel('RMSE', fontsize=12)
     ax.legend(fontsize=10)
     ax.grid(True, which="both", ls="-", alpha=0.2)
 
     plt.tight_layout()
-    plt.savefig('plots_digital_asian/Digital_K100_Analysis.png', dpi=300)
-    print("Saved plots_digital_asian/Digital_K100_Analysis.png")
+    plt.savefig('plots_digital_asian/Digital_Quad_K100_Analysis.png', dpi=300)
+    print("Saved plots_digital_asian/Digital_Quad_K100_Analysis.png")
 
 def plot_k120(df):
+    """
+    K=120 Plots.
+    Plot A: Comprehensive (All methods).
+    Plot B: Variance Reduction Focus (Method vs Method+ODIS).
+    """
     df = df[df['K'] == 120]
     if df.empty: return
 
+    # --- Plot A: Comprehensive ---
+    plt.figure(figsize=(10, 7))
+    methods = df['Method'].unique()
+    
+    for m in methods:
+        sub = df[df['Method'] == m]
+        if sub.empty: continue
+        slope = get_convergence_rate(sub['N'], sub['RMSE'])
+        label_str = f"{m} ($N^{{{slope:.2f}}}$)"
+        plt.loglog(sub['N'], sub['RMSE'], marker='o', label=label_str, base=2)
+
+    plt.title('K=120 (Digital Quad): Comprehensive Comparison', fontsize=14)
+    plt.xlabel('Sample Size $N$ (log2)', fontsize=12)
+    plt.ylabel('RMSE', fontsize=12)
+    plt.grid(True, which="both", alpha=0.2)
+    plt.legend()
+    plt.savefig('plots_digital_asian/Digital_Quad_K120_Comprehensive.png', dpi=300)
+    print("Saved plots_digital_asian/Digital_Quad_K120_Comprehensive.png")
+    plt.close()
+
+    # --- Plot B: Variance Reduction Focus ---
     plt.figure(figsize=(10, 7))
     
-    # Comparison Pairs
     pairs = [
         ('Crude MC', 'MC + ODIS', 'red'),
         ('Plain RQMC', 'RQMC + ODIS', 'blue'),
@@ -403,32 +490,30 @@ def plot_k120(df):
     ]
     
     for base, odis, color in pairs:
-        # Plot Base
         sub_b = df[df['Method'] == base]
         if not sub_b.empty:
             plt.loglog(sub_b['N'], sub_b['RMSE'], color=color, linestyle='--', marker='o', label=base, base=2, alpha=0.5)
         
-        # Plot ODIS
         sub_o = df[df['Method'] == odis]
         if not sub_o.empty:
             slope = get_convergence_rate(sub_o['N'], sub_o['RMSE'])
             label_str = f"{odis} ($N^{{{slope:.2f}}}$)"
             plt.loglog(sub_o['N'], sub_o['RMSE'], color=color, linestyle='-', marker='D', label=label_str, base=2)
 
-    plt.title('K=120 (Digital): Variance Reduction Impact (ODIS)', fontsize=14)
+    plt.title('K=120 (Digital Quad): Variance Reduction Impact (ODIS)', fontsize=14)
     plt.xlabel('Sample Size $N$ (log2)', fontsize=12)
     plt.ylabel('RMSE', fontsize=12)
     plt.grid(True, which="both", alpha=0.2)
     plt.legend()
-    plt.savefig('plots_digital_asian/Digital_K120_Variance.png', dpi=300)
-    print("Saved plots_digital_asian/Digital_K120_Variance.png")
+    plt.savefig('plots_digital_asian/Digital_Quad_K120_Variance_Impact.png', dpi=300)
+    print("Saved plots_digital_asian/Digital_Quad_K120_Variance_Impact.png")
+    plt.close()
 
 # ==========================================
 # 6. Main Execution
 # ==========================================
 
 if __name__ == "__main__":
-    # 1. Run Experiments
     df100 = run_experiment(100)
     df120 = run_experiment(120)
     
@@ -436,8 +521,21 @@ if __name__ == "__main__":
     full_df.to_csv('digital_option_results.csv', index=False)
     print("\nResults saved to digital_option_results.csv.")
     
-    # 2. Generate Plots
     plot_k100(full_df)
     plot_k120(full_df)
+
+    print("\n" + "="*50)
+    print("Find N (Digital)")
+    print("="*50)
+
+    model_test = DigitalAsianOption(S0=S0, K=100, T=T, r=r, sigma=sigma, d=d)
     
-    print("\nDigital Option Analysis Complete.")
+    final_N, final_price = find_N_specific_digital(model_test, tol=0.01)
+    
+    with open('required_N_digital.txt', 'w') as f:
+        f.write(str(final_N))
+    print(f"Saved N={final_N} to 'required_N_digital.txt'")
+    
+    print("\nDigital Option (Quad) Analysis Complete.")
+
+    

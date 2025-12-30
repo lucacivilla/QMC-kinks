@@ -30,6 +30,75 @@ SAMPLE_SIZES = 2**POWERS
 N_REPEATS = 100 # Repetitions for stable RMSE
 
 # ==========================================
+#           Adaptive N Finder
+# ==========================================
+
+def find_N_specific_arithmetic(model, tol=0.01):
+    """
+    Sequential search starting at N=128.
+    Uses specific recursive update formulas for Mean and Variance.
+    """
+    z_score = 1.96  # 95% Confidence
+    
+    # 1. Start with N = 128
+    N = 128
+    # Generate initial batch
+    z_init = np.random.standard_normal((N, model.d))
+    # Z represents the random variable (Payoff)
+    Z_values = model.payoff(z_init) 
+    
+    # Initial Statistics
+    mu = np.mean(Z_values)
+    var = np.var(Z_values, ddof=1)
+    
+    print(f"\n--- Specific Recursive Search (Arithmetic, Start N={N}) ---")
+    print(f"{'N':<10} | {'Mean':<10} | {'Var':<10} | {'RelErr':<10}")
+    print("-" * 55)
+    
+    while True:
+        # -------------------------------------------------------
+        # 2. Generate new single Z_(N+1)
+        # We generate a new path z (standard normal vector) and get its payoff Z
+        # -------------------------------------------------------
+        z_new = np.random.standard_normal((1, model.d))
+        Z_next = model.payoff(z_new)[0]
+        
+        # Save previous mean for variance update
+        mu_old = mu
+        
+        # -------------------------------------------------------
+        # 3. Update Statistics using your specific formulas
+        # -------------------------------------------------------
+        
+        # Update Mean: mu_new = (N / N+1) * mu_old + Z_next / (N+1)
+        mu = (N / (N + 1)) * mu + Z_next / (N + 1)
+        
+        # Update Variance: sigma^2_new = ((N-1)/N)*sigma^2_old + (Z_next - mu_old)^2 / (N+1)
+        # Note: We use the *old* mean (mu_old) inside the squared term as per standard Welford-like logic
+        # matching the structure you provided.
+        var = ((N - 1) / N) * var + (Z_next - mu_old)**2 / (N + 1)
+        
+        # 4. Increment N
+        N += 1
+        
+        # 5. Check Convergence
+        sigma = np.sqrt(max(var, 0.0))
+        
+        if abs(mu) > 1e-12 and sigma > 0:
+            half_width = z_score * sigma / np.sqrt(N)
+            rel_err = half_width / abs(mu)
+            
+            if rel_err <= tol:
+                print("-" * 55)
+                print(f"Converged at N = {N}")
+                print(f"Final Mean: {mu:.6f}")
+                print(f"Final Var:  {var:.6f}")
+                return N, mu
+            
+            if N % 5000 == 0:
+                print(f"{N:<10} | {mu:<10.4f} | {var:<10.4f} | {rel_err:<10.2%}")
+
+# ==========================================
 # 1. Model: Asian Option with Cholesky Path
 # ==========================================
 
@@ -408,6 +477,18 @@ if __name__ == "__main__":
     # 2. Generate Plots
     plot_k100(full_df)
     plot_k120(full_df)
+
+    print("\n" + "="*50)
+    print("Find N (Arithmetic)")
+    print("="*50)
+
+    model_test = AsianOptionCholesky(S0=S0, K=100, T=T, r=r, sigma=sigma, d=d)
+    
+    final_N, final_price = find_N_specific_arithmetic(model_test, tol=0.01)
+    
+    with open('required_N_arithmetic.txt', 'w') as f:
+        f.write(str(final_N))
+    print(f"Saved N={final_N} to 'required_N_arithmetic.txt'")
     
     print("\nProject Complete.")
     
