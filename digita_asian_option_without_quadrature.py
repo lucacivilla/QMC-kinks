@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from tqdm import tqdm
 
+np.random.seed(42)
+
 # ==========================================
 # 0. Setup and Configuration
 # ==========================================
