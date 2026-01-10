@@ -1,0 +1,20 @@
+m     | Option       | Method               | Req N      | Price     
+----------------------------------------------------------------------
+32    | Digital      | CMC+ODIS             | 26752      | 0.0129
+32    | Arithmetic   | CMC+ODIS             | 11648      | 0.0337
+32    | Digital      | RQMC+ODIS            | 25472      | 0.0130
+32    | Digital      | PreInt+ODIS          | 256        | 0.8925
+32    | Arithmetic   | RQMC+ODIS            | 7040       | 0.0338
+32    | Arithmetic   | PreInt+ODIS          | 256        | -13.3001
+64    | Digital      | CMC+ODIS             | 28416      | 0.0119
+64    | Arithmetic   | CMC+ODIS             | 256        | 0.0307
+64    | Digital      | RQMC+ODIS            | 27264      | 0.0117
+64    | Digital      | PreInt+ODIS          | 27904      | 0.0118
+64    | Arithmetic   | RQMC+ODIS            | 8704       | 0.0307
+64    | Arithmetic   | PreInt+ODIS          | 256        | 0.0304
+128   | Digital      | CMC+ODIS             | 26880      | 0.0113
+128   | Arithmetic   | CMC+ODIS             | 11264      | 0.0285
+128   | Digital      | RQMC+ODIS            | 23680      | 0.0111
+128   | Digital      | PreInt+ODIS          | 256        | 0.0112
+128   | Arithmetic   | RQMC+ODIS            | 8832       | 0.0291
+128   | Arithmetic   | PreInt+ODIS          | 256        | -13.3925
