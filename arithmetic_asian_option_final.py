@@ -317,7 +317,7 @@ def standard_estimator(model, N, method='MC', mu_shift=None):
     if method == 'MC':
         z = np.random.standard_normal((N, model.d))  # Standard normal samples
     elif method == 'RQMC':
-        sampler = qmc.Sobol(d=model.d, scramble=True)  # Scrambled Sobol
+        sampler = qmc.Sobol(d=model.d, scramble=np.random.RandomState(42))  # Scrambled Sobol
         u = sampler.random(N)  # Uniform [0,1]^m
         # Clip to avoid Φ^{-1} issues at boundaries
         u = np.clip(u, 1e-10, 1 - 1e-10)

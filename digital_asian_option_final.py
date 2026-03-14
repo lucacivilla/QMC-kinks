@@ -237,7 +237,7 @@ def get_active_subspace(model, M=128):
     Returns:
     - u_as: Dominant direction vector (normalized)
     """
-    sampler = qmc.Sobol(d=model.d, scramble=True)  # Scrambled Sobol sequence
+    sampler = qmc.Sobol(d=model.d, scramble=np.random.RandomState(42))  # Scrambled Sobol sequence
     z_pilot = stats.norm.ppf(sampler.random(M))  # Transform to normal
     
     grads = []
